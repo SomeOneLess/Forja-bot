@@ -34,12 +34,17 @@ function getQuotedMessage(msg) {
   const context = findContextInfo(msg.message);
   if (!context?.quotedMessage) return null;
 
+  // Intentar determinar si el citado es fromMe
+  const participant = context.participant || msg.key.participant || msg.key.remoteJid;
+  const isQuotedFromMe = participant === msg.key.remoteJid || 
+                         (msg.key.fromMe && !context.participant);
+
   return {
     key: {
       remoteJid: msg.key.remoteJid,
       id: context.stanzaId,
-      participant: context.participant || msg.key.participant || msg.key.remoteJid,
-      fromMe: context.participant === msg.key.remoteJid || false // aproximación
+      participant: participant,
+      fromMe: isQuotedFromMe
     },
     message: context.quotedMessage
   };
@@ -70,14 +75,14 @@ function getMediaType(contentOrMsg) {
 
 function isViewOnceContent(contentOrMsg) {
   const content = contentOrMsg?.message ? contentOrMsg.message : contentOrMsg;
+  if (!content) return false;
   const unwrapped = extractMessageContent(content) || content;
   return !!(
     unwrapped?.viewOnceMessage ||
     unwrapped?.viewOnceMessageV2 ||
     unwrapped?.viewOnceMessageV2Extension ||
     unwrapped?.imageMessage?.viewOnce ||
-    unwrapped?.videoMessage?.viewOnce ||
-    unwrapped?.audioMessage?.viewOnce
+    unwrapped?.videoMessage?.viewOnce
   );
 }
 
@@ -133,8 +138,22 @@ async function isGroupAdmin(sock, jid, userJid) {
 }
 
 function getMentions(msg) {
-  const context = findContextInfo(msg.message);
-  return context?.mentionedJid || [];
+  const message = msg.message || {};
+  const contexts = [
+    message.extendedTextMessage?.contextInfo,
+    message.imageMessage?.contextInfo,
+    message.videoMessage?.contextInfo,
+    message.audioMessage?.contextInfo,
+    message.documentMessage?.contextInfo,
+    message.stickerMessage?.contextInfo
+  ].filter(Boolean);
+
+  for (const ctx of contexts) {
+    if (Array.isArray(ctx.mentionedJid) && ctx.mentionedJid.length) {
+      return ctx.mentionedJid;
+    }
+  }
+  return [];
 }
 
 function getQuotedKey(msg) {

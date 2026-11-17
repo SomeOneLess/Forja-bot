@@ -27,7 +27,7 @@ module.exports = {
 
     await reply(sock, jid, {
       text: settings[jid].botCommandsOnly
-        ? '🤖 *Modo bot activado*\nSolo el dueño del bot puede usar comandos en este grupo.\nEl reenvío discreto sigue funcionando normal.'
+        ? '🤖 *Modo bot activado*\nSolo el dueño del bot puede usar comandos en este grupo.'
         : '🤖 *Modo bot desactivado*\nTodos pueden usar comandos.'
     }, msg);
   }

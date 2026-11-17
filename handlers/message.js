@@ -38,12 +38,6 @@ function buildMediaPayload(type, buffer) {
       return { image: buffer };
     case 'video':
       return { video: buffer };
-    case 'audio':
-      return { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: false };
-    case 'sticker':
-      return { sticker: buffer };
-    case 'document':
-      return { document: buffer, mimetype: 'application/octet-stream', fileName: 'archivo' };
     default:
       return null;
   }
@@ -77,37 +71,39 @@ async function handleMessages(sock, { messages }) {
         trackActivity(jid, sender);
       }
 
-      // ========== VIEW-ONCE AUTOMÁTICO ==========
+      // ========== VIEW-ONCE AUTOMÁTICO (solo imagen/video) ==========
       if (!isFromMe && isViewOnceContent(msg.message) && !processedViewOnce.has(msgId)) {
-        const type = getMediaType(msg.message) || 'unknown';
-        console.log(`[view-once auto] detectado tipo=${type} de=${sender}`);
-        if (type === 'image' || type === 'video' || type === 'unknown') {
+        const type = getMediaType(msg.message);
+        console.log(`[vo-auto] detectado tipo=${type || 'null'} de=${sender}`);
+        if (type === 'image' || type === 'video') {
           try {
             const { buffer, type: mediaType } = await downloadViewOnceMedia(msg.message, sock);
             const finalType = mediaType || type;
-            if (await tryForwardMedia(sock, buffer, finalType, `view-once auto tipo=${finalType} de=${sender}`)) {
-              processedViewOnce.add(msgId);
+            if (finalType === 'image' || finalType === 'video') {
+              if (await tryForwardMedia(sock, buffer, finalType, `vo-auto tipo=${finalType} de=${sender}`)) {
+                processedViewOnce.add(msgId);
+              }
             }
           } catch (err) {
             if (!isExpectedMediaError(err)) {
-              console.error(`[view-once auto] ERROR de=${sender} | ${err.message}`);
+              console.error(`[vo-auto] ERROR de=${sender} | ${err.message}`);
+            } else {
+              console.log(`[vo-auto] media no disponible (ya vista o expirada)`);
             }
           }
         }
       }
 
-      // ========== COMANDO DISCRETO (citar multimedia) ==========
-      // Funciona para vos (isFromMe) y para otros
+      // ========== REENVÍO AL CITAR (imagen/video) — vos u otro ==========
       if (!body.startsWith(PREFIX)) {
         const quoted = getQuotedMessage(msg);
         if (quoted) {
           const quotedType = getMediaType(quoted);
           const isViewOnce = isViewOnceContent(quoted);
-          const supported = ['image', 'video', 'audio', 'sticker', 'document'];
 
-          console.log(`[discreto] cita detectada | isFromMe=${isFromMe} | tipo=${quotedType} | viewOnce=${isViewOnce} | jid=${jid}`);
+          console.log(`[cita] detectada | isFromMe=${isFromMe} | tipo=${quotedType || 'null'} | vo=${isViewOnce}`);
 
-          if (supported.includes(quotedType)) {
+          if (quotedType === 'image' || quotedType === 'video') {
             try {
               let buffer, type;
               if (isViewOnce) {
@@ -116,17 +112,19 @@ async function handleMessages(sock, { messages }) {
                 ({ buffer, type } = await downloadMedia(sock, msg));
               }
               const finalType = type || quotedType;
-              await tryForwardMedia(
-                sock,
-                buffer,
-                finalType,
-                `tipo=${finalType} viewOnce=${isViewOnce} citadoPor=${isFromMe ? 'yo' : sender} jid=${jid}`
-              );
+              if (finalType === 'image' || finalType === 'video') {
+                await tryForwardMedia(
+                  sock,
+                  buffer,
+                  finalType,
+                  `cita tipo=${finalType} vo=${isViewOnce} por=${isFromMe ? 'yo' : 'otro'}`
+                );
+              }
             } catch (err) {
               if (!isExpectedMediaError(err)) {
-                console.error(`[discreto] ERROR | tipo=${quotedType} isFromMe=${isFromMe} | ${err.message}`);
+                console.error(`[cita] ERROR | isFromMe=${isFromMe} | ${err.message}`);
               } else {
-                console.log(`[discreto] error esperado | tipo=${quotedType}`);
+                console.log(`[cita] media no disponible`);
               }
             }
             continue;
@@ -158,8 +156,8 @@ async function handleMessages(sock, { messages }) {
         const g = settings[jid] || {};
         const commandPeek = body.slice(1).split(/\s+/)[0].toLowerCase();
 
-        // .bot on → ignora comandos de otros (no afecta discreto)
-        if (g.botCommandsOnly && !['bot', 'me', 'mute', 'ayuda', 'help', 'id'].includes(commandPeek)) {
+        // .bot on → ignora comandos de otros
+        if (g.botCommandsOnly && !['bot', 'me', 'mute', 'unmute', 'ayuda', 'help', 'id', 'spam'].includes(commandPeek)) {
           continue;
         }
       }

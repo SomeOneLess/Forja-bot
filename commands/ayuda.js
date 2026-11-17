@@ -39,7 +39,10 @@ const HELP = `🤖 *${BOT_NAME} — comandos*
 • .admins · .todos
 • .bot on/off — solo el dueño puede usar comandos
 • .me on/off — solo el dueño puede hablar
-• .mute on/off @persona — mutear individualmente (.mute list)
+• .mute @persona — mutear
+• .unmute @persona — desmutear
+• .mute list — ver muteados
+• .spam 50 hola — envía el mensaje N veces (menciona a todos)
 • .id — muestra el JID del chat/grupo actual
 • .silencio on/off — solo admins hablan
 • .op · .deop (citar)
