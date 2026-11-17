@@ -1,0 +1,7 @@
+node_modules/
+auth_info_baileys/
+forjabot-ajustes.json
+forjabot-actividad.json
+cache/
+*.log
+.env

@@ -1,0 +1,985 @@
+'use strict';
+
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+  Browsers,
+  downloadContentFromMessage
+} = require('@whiskeysockets/baileys');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const os = require('os');
+const execFileAsync = promisify(execFile);
+const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
+const pino = require('pino');
+const sharp = require('sharp');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// ====================== CONFIG ======================
+const PREFIX = '.';
+const BOT_NAME = 'ForjaBot';
+const MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024;
+const DATA_DIR = __dirname;
+const SETTINGS_FILE = path.join(DATA_DIR, 'forjabot-ajustes.json');
+const MEDIA_CACHE_DIR = path.join(DATA_DIR, 'media_cache');
+
+// Tu número (chat con vos mismo)
+const MI_NUMERO = '5491149279360@s.whatsapp.net';
+
+const activeGames = new Map();
+const reminderTimers = new Map();
+
+// Crear carpeta de caché si no existe
+if (!fs.existsSync(MEDIA_CACHE_DIR)) {
+  fs.mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
+}
+
+// ====================== ALMACÉN DE MEDIA ======================
+const mediaStore = new Map(); // messageId → { filePath, type, timestamp }
+
+function cleanupOldMedia() {
+  const maxAge = 30 * 60 * 1000; // 30 minutos
+  const now = Date.now();
+
+  for (const [id, data] of mediaStore) {
+    if (now - data.timestamp > maxAge) {
+      try {
+        if (fs.existsSync(data.filePath)) fs.unlinkSync(data.filePath);
+      } catch {}
+      mediaStore.delete(id);
+    }
+  }
+}
+
+function isViewOnce(message) {
+  if (!message) return false;
+  return !!(
+    message.viewOnceMessage ||
+    message.viewOnceMessageV2 ||
+    message.viewOnceMessageV2Extension
+  );
+}
+
+async function storeMediaMessage(sock, msg) {
+  // ========== PROTECCIÓN ANTI-BUCLE ==========
+  if (msg.key.remoteJid === MI_NUMERO) return;
+  if (msg.key.fromMe) return;
+
+  if (!msg?.key?.id || !msg.message) return;
+
+  const type = getMediaType(msg.message);
+  if (!type || !['image', 'video'].includes(type)) return;
+
+  const messageId = msg.key.id;
+  const ext = type === 'video' ? 'mp4' : 'jpg';
+  const filePath = path.join(MEDIA_CACHE_DIR, `${messageId}.${ext}`);
+
+  if (fs.existsSync(filePath)) {
+    mediaStore.set(messageId, { filePath, type, timestamp: Date.now() });
+    return;
+  }
+
+  try {
+    // Intento principal
+    let buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: pino({ level: 'silent' }),
+        reuploadRequest: sock.updateMediaMessage
+      }
+    );
+
+    // Si falló y es view-once, intentar con el mensaje desenvuelto
+    if ((!buffer || buffer.length === 0) && isViewOnce(msg.message)) {
+      const unwrapped = unwrapMessage(msg.message);
+      if (unwrapped) {
+        const fakeMsg = { ...msg, message: unwrapped };
+        try {
+          buffer = await downloadMediaMessage(
+            fakeMsg,
+            'buffer',
+            {},
+            {
+              logger: pino({ level: 'silent' }),
+              reuploadRequest: sock.updateMediaMessage
+            }
+          );
+        } catch {}
+      }
+    }
+
+    if (buffer && buffer.length > 0 && buffer.length <= MAX_DOWNLOAD_BYTES) {
+      fs.writeFileSync(filePath, buffer);
+      mediaStore.set(messageId, { filePath, type, timestamp: Date.now() });
+      console.log(`→ Media guardada en caché: ${messageId} (${type}${isViewOnce(msg.message) ? ' view-once' : ''})`);
+
+      try {
+        const payload = type === 'video' ? { video: buffer } : { image: buffer };
+        await sock.sendMessage(MI_NUMERO, payload);
+        console.log(`→ Reenviada automáticamente a mi número (${type})`);
+      } catch (sendErr) {
+        console.error('Error reenviando automáticamente:', sendErr.message);
+      }
+    }
+  } catch (err) {
+    if (isViewOnce(msg.message)) {
+      console.log(`→ View-once no descargable (restricción de WhatsApp): ${messageId}`);
+    }
+  }
+
+  cleanupOldMedia();
+}
+
+// ====================== UTILIDADES ======================
+function readJson(file, fallback = {}) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function randomInt(max) {
+  return Math.floor(Math.random() * max);
+}
+
+function pick(arr) {
+  return arr[randomInt(arr.length)];
+}
+
+function splitOptions(text) {
+  return String(text || '').split('|').map(s => s.trim()).filter(Boolean);
+}
+
+function parseDuration(input) {
+  const m = String(input).trim().match(/^(\d+)(s|m|h|d)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const factor = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
+  const ms = n * factor;
+  return n > 0 && ms <= 7 * 86400000 ? ms : null;
+}
+
+function isGroupJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+// ====================== HELPERS DE MENSAJES ======================
+function unwrapMessage(messageContent) {
+  if (!messageContent) return null;
+  let current = messageContent;
+  let depth = 0;
+  while (current && depth < 10) {
+    if (current.viewOnceMessage?.message) current = current.viewOnceMessage.message;
+    else if (current.viewOnceMessageV2?.message) current = current.viewOnceMessageV2.message;
+    else if (current.viewOnceMessageV2Extension?.message) current = current.viewOnceMessageV2Extension.message;
+    else if (current.ephemeralMessage?.message) current = current.ephemeralMessage.message;
+    else if (current.documentWithCaptionMessage?.message) current = current.documentWithCaptionMessage.message;
+    else break;
+    depth++;
+  }
+  return current;
+}
+
+function getText(msg) {
+  const m = msg.message || {};
+  if (m.conversation) return m.conversation.trim();
+  if (m.extendedTextMessage?.text) return m.extendedTextMessage.text.trim();
+  if (m.imageMessage?.caption) return m.imageMessage.caption.trim();
+  if (m.videoMessage?.caption) return m.videoMessage.caption.trim();
+  if (m.documentMessage?.caption) return m.documentMessage.caption.trim();
+
+  const unwrapped = unwrapMessage(m);
+  if (unwrapped) {
+    if (unwrapped.conversation) return unwrapped.conversation.trim();
+    if (unwrapped.extendedTextMessage?.text) return unwrapped.extendedTextMessage.text.trim();
+    if (unwrapped.imageMessage?.caption) return unwrapped.imageMessage.caption.trim();
+    if (unwrapped.videoMessage?.caption) return unwrapped.videoMessage.caption.trim();
+  }
+  return '';
+}
+
+function getQuotedMessage(msg) {
+  return (
+    msg.message?.extendedTextMessage?.contextInfo?.quotedMessage ||
+    msg.message?.imageMessage?.contextInfo?.quotedMessage ||
+    msg.message?.videoMessage?.contextInfo?.quotedMessage ||
+    null
+  );
+}
+
+function getQuotedKey(msg) {
+  return (
+    msg.message?.extendedTextMessage?.contextInfo ||
+    msg.message?.imageMessage?.contextInfo ||
+    msg.message?.videoMessage?.contextInfo ||
+    null
+  );
+}
+
+function getMediaType(messageContent) {
+  const unwrapped = unwrapMessage(messageContent);
+  if (!unwrapped) return null;
+  if (unwrapped.imageMessage) return 'image';
+  if (unwrapped.videoMessage) return 'video';
+  if (unwrapped.ptvMessage) return 'video';
+  if (unwrapped.stickerMessage) return 'sticker';
+  if (unwrapped.documentMessage) return 'document';
+  if (unwrapped.audioMessage) return 'audio';
+  return null;
+}
+
+async function downloadMedia(sock, msg) {
+  const quotedKey = getQuotedKey(msg);
+  const quotedId = quotedKey?.stanzaId;
+
+  if (quotedId && mediaStore.has(quotedId)) {
+    const cached = mediaStore.get(quotedId);
+    try {
+      if (fs.existsSync(cached.filePath)) {
+        const buffer = fs.readFileSync(cached.filePath);
+        if (buffer.length > 0 && buffer.length <= MAX_DOWNLOAD_BYTES) {
+          return { buffer, type: cached.type, mimetype: 'application/octet-stream' };
+        }
+      }
+    } catch (err) {
+      console.error('Error leyendo caché:', err.message);
+    }
+  }
+
+  try {
+    const buffer = await downloadMediaMessage(
+      msg,
+      'buffer',
+      {},
+      {
+        logger: pino({ level: 'silent' }),
+        reuploadRequest: sock.updateMediaMessage
+      }
+    );
+
+    if (buffer && buffer.length > 0 && buffer.length <= MAX_DOWNLOAD_BYTES) {
+      const type = getMediaType(msg.message) || 'image';
+      return { buffer, type, mimetype: 'application/octet-stream' };
+    }
+  } catch (err) {
+    console.error('Descarga directa falló:', err.message);
+  }
+
+  throw new Error('No se pudo obtener la media (no está en caché ni se pudo descargar).');
+}
+
+async function makeStickerFromBuffer(buffer) {
+  return sharp(buffer, { failOn: 'none' })
+    .rotate()
+    .resize(512, 512, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    })
+    .webp({ quality: 90 })
+    .toBuffer();
+}
+
+async function makeStickerFromVideo(buffer) {
+  const tmpDir = os.tmpdir();
+  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const inputPath = path.join(tmpDir, `in-${id}.mp4`);
+  const gifPath = path.join(tmpDir, `mid-${id}.gif`);
+  const outputPath = path.join(tmpDir, `out-${id}.webp`);
+
+  fs.writeFileSync(inputPath, buffer);
+
+  try {
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-i', inputPath,
+      '-t', '3',
+      '-vf', 'fps=8,scale=320:320:force_original_aspect_ratio=decrease,pad=320:320:(ow-iw)/2:(oh-ih)/2:color=black',
+      '-an',
+      gifPath
+    ], { timeout: 45000 });
+
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-i', gifPath,
+      '-c:v', 'libwebp_anim',
+      '-loop', '0',
+      '-lossless', '0',
+      '-q:v', '45',
+      '-compression_level', '4',
+      outputPath
+    ], { timeout: 45000 });
+
+    const out = fs.readFileSync(outputPath);
+    if (!out.length) throw new Error('webp vacío');
+    return out;
+  } catch (err) {
+    console.error('ffmpeg animado falló:', err.stderr?.toString?.().slice(-300) || err.message);
+
+    try {
+      const framePath = path.join(tmpDir, `frame-${id}.png`);
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', inputPath,
+        '-frames:v', '1',
+        '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black',
+        framePath
+      ], { timeout: 20000 });
+      const frame = fs.readFileSync(framePath);
+      try { fs.unlinkSync(framePath); } catch {}
+      return makeStickerFromBuffer(frame);
+    } catch {
+      throw new Error('No pude procesar el video en este dispositivo.');
+    }
+  } finally {
+    for (const p of [inputPath, gifPath, outputPath]) {
+      try { fs.unlinkSync(p); } catch {}
+    }
+  }
+}
+
+async function bufferToSticker(buffer, type) {
+  if (type === 'video') return makeStickerFromVideo(buffer);
+  return makeStickerFromBuffer(buffer);
+}
+
+async function isGroupAdmin(sock, jid, userId) {
+  if (!isGroupJid(jid)) return false;
+  try {
+    const meta = await sock.groupMetadata(jid);
+    const p = meta.participants.find(
+      x => x.id === userId || x.id?.split('@')[0] === userId?.split('@')[0]
+    );
+    return Boolean(p && (p.admin === 'admin' || p.admin === 'superadmin'));
+  } catch {
+    return false;
+  }
+}
+
+async function reply(sock, jid, content, quoted) {
+  return sock.sendMessage(jid, content, { quoted });
+}
+
+// ====================== AYUDA ======================
+const HELP = `🤖 *${BOT_NAME} — comandos*
+
+🖼️ *MULTIMEDIA*
+• .s — imagen/video a sticker
+• .png — sticker citado a PNG
+• .meme ARRIBA | ABAJO
+• .rotar [90|180|270]
+• .flip · .invertir
+• .pixelar · .blur
+• .rs — reenvía la foto citada
+
+🎲 *DIVERSIÓN*
+• .dado [caras] · .moneda · .b8 pregunta
+• .vote pregunta | A | B
+• .verdad · .reto
+• .quien — elige alguien al azar
+
+🧰 *UTILIDADES*
+• .qr texto · .password [largo]
+• .tmr 30s
+• .hora · .ping · .clima ciudad
+• .tr texto — traducir
+
+👥 *GRUPOS*
+• .admins · .todos
+• .mute on/off
+• .op · .deop (citar a alguien)
+
+`;
+
+// ====================== BOT ======================
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: Browsers.android('13'),
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    generateHighQualityLinkPreview: false,
+    getMessage: async () => undefined
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('\nEscaneá el QR con WhatsApp → Dispositivos vinculados:\n');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'open') {
+      console.log(`\n✅ ${BOT_NAME} conectado con Baileys.`);
+      console.log(`Escribí ${PREFIX}ayuda en cualquier chat.\n`);
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log('Conexión cerrada. Código:', statusCode);
+
+      if (shouldReconnect) {
+        console.log('Reconectando en 5 segundos...');
+        setTimeout(() => startBot(), 5000);
+      } else {
+        console.log('Sesión cerrada. Borrá auth_info_baileys y volvé a escanear el QR.');
+      }
+    }
+  });
+
+  sock.ev.on('group-participants.update', async (update) => {
+    try {
+      if (update.action !== 'add') return;
+      const settings = readJson(SETTINGS_FILE, {});
+      const welcome = settings[update.id]?.welcome;
+      if (!welcome) return;
+      const mentions = update.participants || [];
+      const names = mentions.map(id => `@${id.split('@')[0]}`).join(' ');
+      await sock.sendMessage(update.id, {
+        text: `${welcome}${names ? `\n${names}` : ''}`,
+        mentions
+      });
+    } catch (err) {
+      console.error('Error bienvenida:', err.message);
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      try {
+        if (!msg.message) continue;
+
+        await storeMediaMessage(sock, msg);
+
+        const jid = msg.key.remoteJid;
+        const sender = msg.key.participant || msg.key.remoteJid;
+        const text = getText(msg);
+        const body = text;
+
+        if (!body.startsWith(PREFIX)) {
+          const quoted = getQuotedMessage(msg);
+          if (quoted) {
+            const quotedType = getMediaType(quoted);
+            if (quotedType === 'image' || quotedType === 'video') {
+              try {
+                const { buffer, type } = await downloadMedia(sock, msg);
+                if (type === 'image' || type === 'video') {
+                  const payload = type === 'video' ? { video: buffer } : { image: buffer };
+                  await sock.sendMessage(MI_NUMERO, payload);
+                  console.log('→ Media citada enviada a mi número');
+                }
+              } catch (err) {
+                console.error('Error comando discreto:', err.message);
+              }
+              continue;
+            }
+          }
+        }
+
+        if (!body.startsWith(PREFIX)) continue;
+
+        if (isGroupJid(jid)) {
+          const settings = readJson(SETTINGS_FILE, {});
+          const commandPeek = body.slice(1).split(/\s+/)[0].toLowerCase();
+          if (
+            settings[jid]?.adminOnly &&
+            !['mute', 'ayuda', 'help'].includes(commandPeek) &&
+            !(await isGroupAdmin(sock, jid, sender)) &&
+            !msg.key.fromMe
+          ) {
+            continue;
+          }
+        }
+
+        const match = body.match(/^\.(\S+)(?:\s+([\s\S]*))?$/);
+        if (!match) continue;
+
+        const command = match[1].toLowerCase();
+        const args = (match[2] || '').trim();
+
+        console.log(`→ comando: .${command} | de: ${jid}`);
+
+        if (command === 'ayuda' || command === 'help') {
+          await reply(sock, jid, { text: HELP }, msg);
+          continue;
+        }
+
+        if (command === 'ping') {
+          const start = Date.now();
+          const sent = await reply(sock, jid, { text: '🏓 Pong. Calculando...' }, msg);
+          const ms = Date.now() - start;
+          await sock.sendMessage(jid, {
+            text: `🏓 Pong. Delay: *${ms} ms*`,
+            edit: sent.key
+          });
+          continue;
+        }
+
+        if (command === 'hora') {
+          const hora = new Date().toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+          await reply(sock, jid, { text: `🕒 ${hora}` }, msg);
+          continue;
+        }
+
+        if (command === 'rs') {
+          try {
+            const { buffer, type } = await downloadMedia(sock, msg);
+            if (type !== 'image') {
+              await reply(sock, jid, { text: 'Respondé a una *foto* con este comando.' }, msg);
+              continue;
+            }
+            await reply(sock, jid, { image: buffer }, msg);
+          } catch (err) {
+            await reply(sock, jid, { text: `⚠️ No pude reenviar la foto: ${err.message}` }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'sticker' || command === 's' || command === 'stiker') {
+          try {
+            const { buffer, type } = await downloadMedia(sock, msg);
+            const stickerBuffer = await bufferToSticker(buffer, type);
+            await reply(sock, jid, { sticker: stickerBuffer }, msg);
+          } catch (err) {
+            console.error('Error sticker:', err);
+            await reply(sock, jid, {
+              text: `⚠️ No pude crear el sticker: ${err.message}\n\nRespondé a una imagen, video, GIF o nota de video con .s`
+            }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'png') {
+          try {
+            const { buffer, type } = await downloadMedia(sock, msg);
+            if (type !== 'sticker') {
+              await reply(sock, jid, { text: 'Respondé a un sticker con .png' }, msg);
+              continue;
+            }
+            const png = await sharp(buffer).png().toBuffer();
+            await reply(sock, jid, { image: png, caption: 'Convertido a PNG' }, msg);
+          } catch (err) {
+            await reply(sock, jid, { text: `⚠️ ${err.message}` }, msg);
+          }
+          continue;
+        }
+
+        if (['rotar', 'flip', 'invertir', 'pixelar', 'blur'].includes(command)) {
+          try {
+            const { buffer } = await downloadMedia(sock, msg);
+
+            if (command === 'pixelar') {
+              const meta = await sharp(buffer, { failOn: 'none' }).rotate().metadata();
+              const w = meta.width || 512;
+              const h = meta.height || 512;
+              const factor = 16;
+              const small = await sharp(buffer, { failOn: 'none' })
+                .rotate()
+                .resize(Math.max(1, Math.floor(w / factor)), Math.max(1, Math.floor(h / factor)), { kernel: 'nearest' })
+                .toBuffer();
+              const out = await sharp(small)
+                .resize(w, h, { kernel: 'nearest' })
+                .png()
+                .toBuffer();
+              await reply(sock, jid, { image: out }, msg);
+              continue;
+            }
+
+            if (command === 'blur') {
+              const out = await sharp(buffer, { failOn: 'none' })
+                .rotate()
+                .blur(12)
+                .png()
+                .toBuffer();
+              await reply(sock, jid, { image: out }, msg);
+              continue;
+            }
+
+            let img = sharp(buffer, { failOn: 'none' }).rotate();
+
+            if (command === 'rotar') {
+              const angle = args ? Number(args) : 90;
+              if (![90, 180, 270].includes(angle)) {
+                await reply(sock, jid, { text: 'Usá .rotar 90, 180 o 270.' }, msg);
+                continue;
+              }
+              img = img.rotate(angle);
+            } else if (command === 'flip') {
+              img = img.flop();
+            } else if (command === 'invertir') {
+              img = img.negate();
+            }
+
+            const out = await img.png().toBuffer();
+            await reply(sock, jid, { image: out }, msg);
+          } catch (err) {
+            await reply(sock, jid, { text: `⚠️ ${err.message}` }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'meme') {
+          try {
+            const { buffer } = await downloadMedia(sock, msg);
+            const parts = splitOptions(args);
+            if (parts.length < 1) {
+              await reply(sock, jid, { text: 'Uso: respondé a una imagen con .meme ARRIBA | ABAJO' }, msg);
+              continue;
+            }
+
+            const top = (parts[0] || '').slice(0, 35).toUpperCase();
+            const bottom = (parts[1] || '').slice(0, 35).toUpperCase();
+
+            const escapeXml = (t) =>
+              String(t)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+
+            const base = await sharp(buffer, { failOn: 'none' })
+              .rotate()
+              .resize(800, 800, { fit: 'cover' })
+              .png()
+              .toBuffer();
+
+            const svgText = `
+              <svg width="800" height="800">
+                <style>
+                  .t { font-family: Arial, Helvetica, sans-serif; font-size: 48px; font-weight: bold; fill: white; stroke: black; stroke-width: 8px; paint-order: stroke; }
+                </style>
+                ${top ? `<text x="400" y="60" text-anchor="middle" class="t">${escapeXml(top)}</text>` : ''}
+                ${bottom ? `<text x="400" y="760" text-anchor="middle" class="t">${escapeXml(bottom)}</text>` : ''}
+              </svg>`;
+
+            const overlay = await sharp(Buffer.from(svgText)).png().toBuffer();
+
+            const out = await sharp(base)
+              .composite([{ input: overlay }])
+              .jpeg({ quality: 90 })
+              .toBuffer();
+
+            await reply(sock, jid, { image: out }, msg);
+          } catch (err) {
+            console.error('Error meme:', err);
+            await reply(sock, jid, { text: `⚠️ No pude generar el meme: ${err.message}` }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'dado') {
+          const sides = Number.parseInt(args, 10) || 6;
+          if (sides < 2 || sides > 100) {
+            await reply(sock, jid, { text: 'Usá entre 2 y 100 caras. Ej: .dado 20' }, msg);
+            continue;
+          }
+          await reply(sock, jid, { text: `🎲 Salió ${randomInt(sides) + 1} (d${sides}).` }, msg);
+          continue;
+        }
+
+        if (command === 'moneda') {
+          await reply(sock, jid, { text: pick(['🪙 Cara', '🪙 Cruz']) }, msg);
+          continue;
+        }
+
+        if (command === 'b8') {
+          if (!args) {
+            await reply(sock, jid, { text: 'Ejemplo: .b8 ¿sale asado el domingo?' }, msg);
+            continue;
+          }
+          const respuestas = [
+            'Sí, sin dudas.', 'Todo apunta a que sí.', 'Probablemente.',
+            'No cuentes con eso.', 'Las señales dicen que no.',
+            'Preguntá de nuevo más tarde.', 'No puedo asegurarlo.', 'Es mejor que no.'
+          ];
+          await reply(sock, jid, { text: `🎱 ${pick(respuestas)}` }, msg);
+          continue;
+        }
+
+        if (command === 'vote') {
+          const parts = splitOptions(args);
+          if (parts.length < 3) {
+            await reply(sock, jid, { text: 'Uso: .vote ¿Qué hacemos? | Opción A | Opción B' }, msg);
+            continue;
+          }
+          const question = parts.shift();
+          try {
+            await sock.sendMessage(jid, {
+              poll: {
+                name: question,
+                values: parts.slice(0, 12),
+                selectableCount: 1
+              }
+            }, { quoted: msg });
+          } catch {
+            await reply(sock, jid, { text: 'No pude crear la encuesta.' }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'verdad' || command === 'reto') {
+          const truths = [
+            '¿Qué cosa te da vergüenza admitir?',
+            '¿Cuál fue tu primera impresión de alguien de este grupo?',
+            '¿Qué talento inútil tenés?',
+            '¿Cuál es una manía que no podés evitar?'
+          ];
+          const dares = [
+            'Mandá un emoji que describa tu día.',
+            'Escribí una frase como si fueras un villano.',
+            'Contá un chiste malo.'
+          ];
+          await reply(sock, jid, {
+            text: `${command === 'verdad' ? '🫣 *VERDAD*' : '🔥 *RETO*'}\n${pick(command === 'verdad' ? truths : dares)}`
+          }, msg);
+          continue;
+        }
+
+        if (command === 'quien') {
+          if (!isGroupJid(jid)) {
+            await reply(sock, jid, { text: 'Este comando funciona dentro de un grupo.' }, msg);
+            continue;
+          }
+          try {
+            const meta = await sock.groupMetadata(jid);
+            const participants = meta.participants.filter(p => p.id);
+            if (!participants.length) {
+              await reply(sock, jid, { text: 'No pude obtener los miembros.' }, msg);
+              continue;
+            }
+            const elegido = pick(participants);
+            await reply(sock, jid, {
+              text: `🎲 Elegido al azar: @${elegido.id.split('@')[0]}`,
+              mentions: [elegido.id]
+            }, msg);
+          } catch {
+            await reply(sock, jid, { text: 'No pude elegir a alguien.' }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'qr') {
+          if (!args) {
+            await reply(sock, jid, { text: 'Uso: .qr texto o enlace' }, msg);
+            continue;
+          }
+          const qrBuffer = await QRCode.toBuffer(args.slice(0, 1500), {
+            type: 'png', width: 700, margin: 2, errorCorrectionLevel: 'M'
+          });
+          await reply(sock, jid, {
+            image: qrBuffer,
+            caption: '📱 Código QR generado por ForjaBot.'
+          }, msg);
+          continue;
+        }
+
+        if (command === 'password' || command === 'pass') {
+          const length = args ? Number.parseInt(args, 10) : 16;
+          if (!Number.isInteger(length) || length < 8 || length > 64) {
+            await reply(sock, jid, { text: 'Longitud entre 8 y 64. Ej: .password 20' }, msg);
+            continue;
+          }
+          const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*+-_';
+          const bytes = crypto.randomBytes(length);
+          const password = Array.from(bytes, b => chars[b % chars.length]).join('');
+          await reply(sock, jid, {
+            text: `🔐 Contraseña (${length}):\n\`${password}\`\nGuardala en un lugar seguro.`
+          }, msg);
+          continue;
+        }
+
+        if (command === 'tmr') {
+          const ms = parseDuration(args);
+          if (!ms) {
+            await reply(sock, jid, { text: 'Uso: .tmr 30s (también m/h/d, máx 7 días)' }, msg);
+            continue;
+          }
+          const timerId = `${jid}:${Date.now()}:${randomInt(100000)}`;
+          const timer = setTimeout(() => {
+            reminderTimers.delete(timerId);
+            sock.sendMessage(jid, { text: `⏰ ¡Terminó el temporizador de ${args}!` }).catch(console.error);
+          }, ms);
+          reminderTimers.set(timerId, timer);
+          await reply(sock, jid, { text: `⏱️ Temporizador iniciado: ${args}.` }, msg);
+          continue;
+        }
+
+        if (command === 'clima') {
+          if (!args) {
+            await reply(sock, jid, { text: 'Uso: .clima Buenos Aires' }, msg);
+            continue;
+          }
+          try {
+            const q = encodeURIComponent(args.slice(0, 80));
+            const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${q}&count=1&language=es&format=json`);
+            const geo = await geoRes.json();
+            const place = geo?.results?.[0];
+            if (!place) {
+              await reply(sock, jid, { text: 'No encontré esa ciudad.' }, msg);
+              continue;
+            }
+            const wRes = await fetch(
+              `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&timezone=auto`
+            );
+            const w = await wRes.json();
+            const c = w.current;
+            await reply(sock, jid, {
+              text:
+                `🌤️ *${place.name}${place.admin1 ? ', ' + place.admin1 : ''}*\n` +
+                `Temp: ${c.temperature_2m}°C\n` +
+                `Humedad: ${c.relative_humidity_2m}%\n` +
+                `Viento: ${c.wind_speed_10m} km/h`
+            }, msg);
+          } catch {
+            await reply(sock, jid, { text: '⚠️ No pude consultar el clima ahora.' }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'tr') {
+          if (!args) {
+            await reply(sock, jid, { text: 'Uso: .tr texto a traducir' }, msg);
+            continue;
+          }
+          try {
+            const q = encodeURIComponent(args.slice(0, 500));
+            const res = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=es|en`);
+            const data = await res.json();
+            const translated = data?.responseData?.translatedText || 'No se pudo traducir.';
+            await reply(sock, jid, { text: `🌐 *Traducción:*\n${translated}` }, msg);
+          } catch {
+            await reply(sock, jid, { text: '⚠️ Error al traducir.' }, msg);
+          }
+          continue;
+        }
+
+        if (command === 'admins' || command === 'todos') {
+          if (!isGroupJid(jid)) {
+            await reply(sock, jid, { text: 'Este comando funciona dentro de un grupo.' }, msg);
+            continue;
+          }
+
+          const meta = await sock.groupMetadata(jid);
+
+          if (command === 'admins') {
+            const admins = meta.participants.filter(p => p.admin === 'admin' || p.admin === 'superadmin');
+            const lines = admins.map(p => `• @${p.id.split('@')[0]}`);
+            await reply(sock, jid, {
+              text: `🛡️ *Administradores*\n${lines.join('\n') || 'No pude obtener la lista.'}`,
+              mentions: admins.map(p => p.id)
+            }, msg);
+            continue;
+          }
+
+          if (command === 'todos') {
+            if (!(await isGroupAdmin(sock, jid, sender)) && !msg.key.fromMe) {
+              await reply(sock, jid, { text: 'Solo los administradores pueden usar este comando.' }, msg);
+              continue;
+            }
+            const ids = meta.participants.map(p => p.id).filter(Boolean);
+            const textMsg = args || 'Atención.';
+            await sock.sendMessage(jid, {
+              text: textMsg,
+              mentions: ids
+            });
+            continue;
+          }
+        }
+
+        if (command === 'mute') {
+          if (!isGroupJid(jid)) {
+            await reply(sock, jid, { text: 'Este comando funciona dentro de un grupo.' }, msg);
+            continue;
+          }
+          if (!(await isGroupAdmin(sock, jid, sender)) && !msg.key.fromMe) {
+            await reply(sock, jid, { text: 'Solo los administradores pueden cambiar este ajuste.' }, msg);
+            continue;
+          }
+          if (!['on', 'off'].includes(args.toLowerCase())) {
+            await reply(sock, jid, { text: 'Uso: .mute on o .mute off' }, msg);
+            continue;
+          }
+          const settings = readJson(SETTINGS_FILE, {});
+          settings[jid] ||= {};
+          settings[jid].adminOnly = args.toLowerCase() === 'on';
+          writeJson(SETTINGS_FILE, settings);
+          await reply(sock, jid, {
+            text: settings[jid].adminOnly
+              ? '🔇 Modo silencio activado: solo admins pueden usar comandos.'
+              : '🔊 Modo silencio desactivado.'
+          }, msg);
+          continue;
+        }
+
+        if (command === 'op' || command === 'deop') {
+          if (!isGroupJid(jid)) {
+            await reply(sock, jid, { text: 'Este comando funciona dentro de un grupo.' }, msg);
+            continue;
+          }
+          if (!(await isGroupAdmin(sock, jid, sender)) && !msg.key.fromMe) {
+            await reply(sock, jid, { text: 'Solo los administradores pueden usar este comando.' }, msg);
+            continue;
+          }
+
+          const quotedKey = getQuotedKey(msg);
+          const target = quotedKey?.participant;
+          if (!target) {
+            await reply(sock, jid, { text: 'Citá a alguien para usar este comando.' }, msg);
+            continue;
+          }
+
+          try {
+            if (command === 'op') {
+              await sock.groupParticipantsUpdate(jid, [target], 'promote');
+              await reply(sock, jid, { text: `✅ @${target.split('@')[0]} ahora es admin.`, mentions: [target] }, msg);
+            } else {
+              await sock.groupParticipantsUpdate(jid, [target], 'demote');
+              await reply(sock, jid, { text: `⬇️ @${target.split('@')[0]} ya no es admin.`, mentions: [target] }, msg);
+            }
+          } catch (err) {
+            await reply(sock, jid, { text: `⚠️ No pude cambiar el rol: ${err.message}` }, msg);
+          }
+          continue;
+        }
+
+      } catch (err) {
+        console.error('Error procesando mensaje:', err);
+        try {
+          await sock.sendMessage(msg.key.remoteJid, {
+            text: `⚠️ No pude completar el comando: ${err.message || 'error inesperado'}`
+          }, { quoted: msg });
+        } catch {}
+      }
+    }
+  });
+}
+
+startBot().catch(err => {
+  console.error('Error fatal:', err);
+  process.exit(1);
+});
