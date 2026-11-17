@@ -22,29 +22,31 @@ function findContextInfo(message) {
     message.videoMessage?.contextInfo,
     message.audioMessage?.contextInfo,
     message.documentMessage?.contextInfo,
-    message.stickerMessage?.contextInfo,
-    message.buttonsResponseMessage?.contextInfo,
-    message.listResponseMessage?.contextInfo,
-    message.templateButtonReplyMessage?.contextInfo
+    message.stickerMessage?.contextInfo
   ];
-  return candidates.find(c => c?.quotedMessage) || null;
+  return candidates.find(c => c && (c.quotedMessage || c.mentionedJid)) || null;
 }
 
 function getQuotedMessage(msg) {
-  const context = findContextInfo(msg.message);
-  if (!context?.quotedMessage) return null;
+  const message = msg.message || {};
+  const contexts = [
+    message.extendedTextMessage?.contextInfo,
+    message.imageMessage?.contextInfo,
+    message.videoMessage?.contextInfo,
+    message.audioMessage?.contextInfo,
+    message.documentMessage?.contextInfo,
+    message.stickerMessage?.contextInfo
+  ].filter(Boolean);
 
-  // Intentar determinar si el citado es fromMe
-  const participant = context.participant || msg.key.participant || msg.key.remoteJid;
-  const isQuotedFromMe = participant === msg.key.remoteJid || 
-                         (msg.key.fromMe && !context.participant);
+  const context = contexts.find(c => c.quotedMessage);
+  if (!context?.quotedMessage) return null;
 
   return {
     key: {
       remoteJid: msg.key.remoteJid,
       id: context.stanzaId,
-      participant: participant,
-      fromMe: isQuotedFromMe
+      participant: context.participant || undefined,
+      fromMe: false
     },
     message: context.quotedMessage
   };
@@ -76,53 +78,61 @@ function getMediaType(contentOrMsg) {
 function isViewOnceContent(contentOrMsg) {
   const content = contentOrMsg?.message ? contentOrMsg.message : contentOrMsg;
   if (!content) return false;
-  const unwrapped = extractMessageContent(content) || content;
+  const extracted = extractMessageContent(content) || content;
   return !!(
-    unwrapped?.viewOnceMessage ||
-    unwrapped?.viewOnceMessageV2 ||
-    unwrapped?.viewOnceMessageV2Extension ||
-    unwrapped?.imageMessage?.viewOnce ||
-    unwrapped?.videoMessage?.viewOnce
+    extracted?.viewOnceMessage ||
+    extracted?.viewOnceMessageV2 ||
+    extracted?.viewOnceMessageV2Extension ||
+    extracted?.imageMessage?.viewOnce ||
+    extracted?.videoMessage?.viewOnce
   );
 }
 
-async function downloadViewOnceMedia(quotedOrContent, sock) {
-  const fakeMsg = quotedOrContent.message
-    ? quotedOrContent
-    : { message: quotedOrContent, key: {} };
+async function safeDownload(waMessage, sock) {
+  if (!waMessage?.message) throw new Error('Mensaje sin contenido');
+  const buffer = await downloadMediaMessage(
+    waMessage,
+    'buffer',
+    {},
+    {
+      logger: { level: 'silent', child() { return this; } },
+      reuploadRequest: sock.updateMediaMessage
+    }
+  );
+  if (!buffer || !buffer.length) throw new Error('Buffer vacío');
+  return buffer;
+}
 
-  try {
-    const buffer = await downloadMediaMessage(
-      fakeMsg,
-      'buffer',
-      {},
-      {
-        logger: { level: 'silent', child: () => ({ level: 'silent' }) },
-        reuploadRequest: sock.updateMediaMessage
-      }
-    );
-    const type = getMediaType(fakeMsg);
-    return { buffer, type };
-  } catch (err) {
-    console.error('[downloadViewOnce] fallo:', err.message);
-    throw err;
+async function downloadViewOnceMedia(source, sock) {
+  // source puede ser el WAMessage completo o solo el content
+  let waMsg;
+  if (source.key && source.message) {
+    waMsg = source;
+  } else {
+    // Es solo el content: hay que envolverlo
+    const content = source.message || source;
+    waMsg = {
+      key: source.key || { remoteJid: '', id: '', fromMe: false },
+      message: content
+    };
   }
+
+  // Asegurarse de que el message esté desenvuelto si es necesario
+  const inner = unwrapViewOnce(extractMessageContent(waMsg.message) || waMsg.message);
+  if (inner && inner !== waMsg.message) {
+    waMsg = { ...waMsg, message: inner };
+  }
+
+  const buffer = await safeDownload(waMsg, sock);
+  const type = getMediaType(waMsg);
+  return { buffer, type };
 }
 
 async function downloadMedia(sock, msg) {
   const quoted = getQuotedMessage(msg);
   const target = quoted || msg;
 
-  const buffer = await downloadMediaMessage(
-    target,
-    'buffer',
-    {},
-    {
-      logger: { level: 'silent', child: () => ({ level: 'silent' }) },
-      reuploadRequest: sock.updateMediaMessage
-    }
-  );
-
+  const buffer = await safeDownload(target, sock);
   const type = getMediaType(target);
   return { buffer, type };
 }

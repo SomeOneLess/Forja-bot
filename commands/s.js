@@ -10,7 +10,7 @@ module.exports = {
       const stickerBuffer = await bufferToSticker(buffer, type);
       await reply(sock, jid, { sticker: stickerBuffer }, msg);
     } catch (err) {
-      console.error('Error sticker:', err);
+      console.error('Error sticker:', err.message);
       await reply(sock, jid, {
         text: `⚠️ No pude crear el sticker: ${err.message}\n\nRespondé a una imagen, video, GIF o nota de video con .s`
       }, msg);

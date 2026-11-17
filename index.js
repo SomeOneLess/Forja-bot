@@ -18,7 +18,8 @@ function startHourlySeparator(sock) {
   setInterval(() => {
     const now = new Date();
     const hour = now.getHours();
-    if (hour !== lastSeparatorHour) {
+    // Cada 2 horas: 00, 02, 04, 06...
+    if (hour % 2 === 0 && hour !== lastSeparatorHour) {
       lastSeparatorHour = hour;
       sock.sendMessage(DESTINO, { text: '-----' }).catch(err => {
         console.error('[separador] no pude enviar:', err.message);

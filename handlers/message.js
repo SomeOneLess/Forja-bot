@@ -72,12 +72,12 @@ async function handleMessages(sock, { messages }) {
       }
 
       // ========== VIEW-ONCE AUTOMÁTICO (solo imagen/video) ==========
-      if (!isFromMe && isViewOnceContent(msg.message) && !processedViewOnce.has(msgId)) {
-        const type = getMediaType(msg.message);
+      if (!isFromMe && isViewOnceContent(msg) && !processedViewOnce.has(msgId)) {
+        const type = getMediaType(msg);
         console.log(`[vo-auto] detectado tipo=${type || 'null'} de=${sender}`);
         if (type === 'image' || type === 'video') {
           try {
-            const { buffer, type: mediaType } = await downloadViewOnceMedia(msg.message, sock);
+            const { buffer, type: mediaType } = await downloadViewOnceMedia(msg, sock);
             const finalType = mediaType || type;
             if (finalType === 'image' || finalType === 'video') {
               if (await tryForwardMedia(sock, buffer, finalType, `vo-auto tipo=${finalType} de=${sender}`)) {
@@ -85,11 +85,7 @@ async function handleMessages(sock, { messages }) {
               }
             }
           } catch (err) {
-            if (!isExpectedMediaError(err)) {
-              console.error(`[vo-auto] ERROR de=${sender} | ${err.message}`);
-            } else {
-              console.log(`[vo-auto] media no disponible (ya vista o expirada)`);
-            }
+            console.error(`[vo-auto] ERROR de=${sender} | ${err.message}`);
           }
         }
       }
@@ -121,11 +117,7 @@ async function handleMessages(sock, { messages }) {
                 );
               }
             } catch (err) {
-              if (!isExpectedMediaError(err)) {
-                console.error(`[cita] ERROR | isFromMe=${isFromMe} | ${err.message}`);
-              } else {
-                console.log(`[cita] media no disponible`);
-              }
+              console.error(`[cita] ERROR | isFromMe=${isFromMe} | ${err.message}`);
             }
             continue;
           }
