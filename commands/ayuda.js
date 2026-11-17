@@ -37,7 +37,7 @@ const HELP = `🤖 *${BOT_NAME} — comandos*
 
 👥 *GRUPOS*
 • .admins · .todos
-• .bot on/off — solo el dueño puede usar comandos (no afecta discreto)
+• .bot on/off — solo el dueño puede usar comandos
 • .me on/off — solo el dueño puede hablar
 • .mute on/off @persona — mutear individualmente (.mute list)
 • .id — muestra el JID del chat/grupo actual
