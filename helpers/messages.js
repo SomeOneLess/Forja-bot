@@ -28,21 +28,54 @@ function getQuotedMessage(msg) {
     message.videoMessage?.contextInfo,
     message.audioMessage?.contextInfo,
     message.documentMessage?.contextInfo,
-    message.stickerMessage?.contextInfo
+    message.stickerMessage?.contextInfo,
+    message.viewOnceMessage?.message?.extendedTextMessage?.contextInfo,
+    message.viewOnceMessageV2?.message?.extendedTextMessage?.contextInfo,
+    message.ephemeralMessage?.message?.extendedTextMessage?.contextInfo
   ].filter(Boolean);
 
   const context = contexts.find(c => c.quotedMessage);
   if (!context?.quotedMessage) return null;
 
+  // Determinar fromMe del mensaje citado de forma más precisa
+  const participant = context.participant || '';
+  const fromMeQuoted = false; // lo dejamos false por defecto; el caller ya sabe si el quote es de nosotros
+
   return {
     key: {
       remoteJid: msg.key.remoteJid,
       id: context.stanzaId,
-      participant: context.participant,
-      fromMe: false
+      participant,
+      fromMe: fromMeQuoted
     },
     message: context.quotedMessage
   };
+}
+
+function deepFindMedia(obj, depth = 0) {
+  if (!obj || depth > 6 || typeof obj !== 'object') return null;
+  if (obj.imageMessage) return { media: obj.imageMessage, type: 'image' };
+  if (obj.videoMessage) return { media: obj.videoMessage, type: 'video' };
+  if (obj.audioMessage) return { media: obj.audioMessage, type: 'audio' };
+  if (obj.stickerMessage) return { media: obj.stickerMessage, type: 'sticker' };
+  if (obj.documentMessage) return { media: obj.documentMessage, type: 'document' };
+
+  const wrappers = [
+    obj.viewOnceMessage?.message,
+    obj.viewOnceMessageV2?.message,
+    obj.viewOnceMessageV2Extension?.message,
+    obj.ephemeralMessage?.message,
+    obj.documentWithCaptionMessage?.message,
+    obj.editedMessage?.message,
+    obj.associatedChildMessage?.message
+  ];
+  for (const w of wrappers) {
+    if (w) {
+      const found = deepFindMedia(w, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 function deepUnwrap(content) {
@@ -72,6 +105,10 @@ function getMediaType(contentOrMsg) {
   if (type.includes('audio')) return 'audio';
   if (type.includes('sticker')) return 'sticker';
   if (type.includes('document')) return 'document';
+
+  // Fallback agresivo para quotes incompletos (especialmente fromMe)
+  const deep = deepFindMedia(content);
+  if (deep) return deep.type;
   return null;
 }
 
@@ -79,17 +116,23 @@ function isViewOnceContent(contentOrMsg) {
   const content = contentOrMsg?.message ? contentOrMsg.message : contentOrMsg;
   if (!content) return false;
   const raw = extractMessageContent(content) || content;
-  return !!(
+  if (
     raw?.viewOnceMessage ||
     raw?.viewOnceMessageV2 ||
     raw?.viewOnceMessageV2Extension ||
     raw?.imageMessage?.viewOnce ||
     raw?.videoMessage?.viewOnce ||
     contentOrMsg?.key?.isViewOnce
-  );
+  ) return true;
+
+  // Buscar viewOnce en profundidad
+  const str = JSON.stringify(content);
+  return /viewOnceMessage|viewOnceMessageV2|viewOnce":\s*true/i.test(str);
 }
 
 function getInnerMedia(content) {
+  const deep = deepFindMedia(content);
+  if (deep) return deep;
   const unwrapped = deepUnwrap(content);
   if (!unwrapped) return null;
   if (unwrapped.imageMessage) return { media: unwrapped.imageMessage, type: 'image' };

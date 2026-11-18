@@ -22,40 +22,39 @@ const commands = require('../commands');
 // Estado compartido
 const processedViewOnce = new Set();
 
-// Cache de mensajes VO completos (para que el quote funcione aunque el quotedMessage venga incompleto)
-const voCache = new Map(); // key.id -> { msg, ts }
-const VO_CACHE_TTL = 15 * 60 * 1000; // 15 minutos
-const VO_CACHE_MAX = 80;
+// Cache de buffers descargados (por message id del original)
+const bufferCache = new Map(); // id -> { buffer, type, ts }
+const BUFFER_CACHE_TTL = 20 * 60 * 1000; // 20 min
+const BUFFER_CACHE_MAX = 40;
 
-function cleanupVoCache() {
+function cleanupBufferCache() {
   const now = Date.now();
-  for (const [id, entry] of voCache) {
-    if (now - entry.ts > VO_CACHE_TTL) voCache.delete(id);
+  for (const [id, entry] of bufferCache) {
+    if (now - entry.ts > BUFFER_CACHE_TTL) bufferCache.delete(id);
   }
-  while (voCache.size > VO_CACHE_MAX) {
-    const oldestKey = voCache.keys().next().value;
-    if (oldestKey) voCache.delete(oldestKey);
+  while (bufferCache.size > BUFFER_CACHE_MAX) {
+    const oldest = bufferCache.keys().next().value;
+    if (oldest) bufferCache.delete(oldest);
     else break;
   }
 }
 
-function cacheVO(msg) {
-  const id = msg?.key?.id;
-  if (!id) return;
-  cleanupVoCache();
-  voCache.set(id, { msg, ts: Date.now() });
-  console.log(`[vo-cache] guardado id=${id} (total=${voCache.size})`);
+function cacheBuffer(id, buffer, type) {
+  if (!id || !buffer?.length) return;
+  cleanupBufferCache();
+  bufferCache.set(id, { buffer, type, ts: Date.now() });
+  console.log(`[buffer-cache] guardado id=${id} tipo=${type} size=${buffer.length} (total=${bufferCache.size})`);
 }
 
-function getCachedVO(id) {
+function getCachedBuffer(id) {
   if (!id) return null;
-  const entry = voCache.get(id);
+  const entry = bufferCache.get(id);
   if (!entry) return null;
-  if (Date.now() - entry.ts > VO_CACHE_TTL) {
-    voCache.delete(id);
+  if (Date.now() - entry.ts > BUFFER_CACHE_TTL) {
+    bufferCache.delete(id);
     return null;
   }
-  return entry.msg;
+  return entry;
 }
 
 function jidBase(jid) {
@@ -112,15 +111,13 @@ async function handleMessages(sock, { messages }) {
         const type = getMediaType(msg);
         console.log(`[vo-auto] detectado tipo=${type || 'null'} de=${sender} isFromMe=${isFromMe}`);
         if (type === 'image' || type === 'video') {
-          // Cachear siempre el mensaje original completo (aunque falle el download ahora)
-          cacheVO(msg);
-
           try {
             const { buffer, type: mediaType } = await downloadViewOnceMedia(msg, sock);
             const finalType = mediaType || type;
             if (finalType === 'image' || finalType === 'video') {
               if (await tryForwardMedia(sock, buffer, finalType, `vo-auto tipo=${finalType} de=${sender}`)) {
                 processedViewOnce.add(msgId);
+                cacheBuffer(msg.key.id, buffer, finalType);
               }
             }
           } catch (err) {
@@ -134,22 +131,40 @@ async function handleMessages(sock, { messages }) {
         const quoted = getQuotedMessage(msg);
         if (quoted) {
           const quotedId = quoted.key?.id;
-          const cachedOriginal = getCachedVO(quotedId);
-          const source = cachedOriginal || quoted;
-          const usedCache = !!cachedOriginal;
+          const cachedBuf = getCachedBuffer(quotedId);
+          const quotedType = getMediaType(quoted);
+          const isViewOnce = isViewOnceContent(quoted);
 
-          const quotedType = getMediaType(source);
-          const isViewOnce = isViewOnceContent(source) || isViewOnceContent(quoted);
+          // Diagnóstico extra para quotes propios (estructura distinta)
+          if (isFromMe) {
+            const qm = quoted.message || {};
+            const keys = Object.keys(qm).filter(k => !k.startsWith('messageContext') && k !== 'senderKeyDistributionMessage');
+            console.log(`[cita-yo] quotedId=${quotedId || 'null'} keys=[${keys.join(',')}] tipoDetectado=${quotedType || 'null'} vo=${isViewOnce} bufferCache=${!!cachedBuf}`);
+          }
 
-          console.log(`[cita] detectada | isFromMe=${isFromMe} | tipo=${quotedType || 'null'} | vo=${isViewOnce} | cache=${usedCache} | quotedId=${quotedId || 'null'}`);
+          console.log(`[cita] detectada | isFromMe=${isFromMe} | tipo=${quotedType || 'null'} | vo=${isViewOnce} | bufferCache=${!!cachedBuf} | quotedId=${quotedId || 'null'}`);
 
-          if (quotedType === 'image' || quotedType === 'video') {
+          // Usar buffer cacheado si existe (especialmente útil en fromMe)
+          if (cachedBuf && (cachedBuf.type === 'image' || cachedBuf.type === 'video')) {
+            try {
+              await tryForwardMedia(
+                sock,
+                cachedBuf.buffer,
+                cachedBuf.type,
+                `cita-cache tipo=${cachedBuf.type} por=${isFromMe ? 'yo' : 'otro'}`
+              );
+            } catch (err) {
+              console.error(`[cita] ERROR usando cache | ${err.message}`);
+            }
+            continue;
+          }
+
+          if (quotedType === 'image' || quotedType === 'video' || (isFromMe && isViewOnce)) {
             try {
               let buffer, type;
-              if (isViewOnce) {
-                ({ buffer, type } = await downloadViewOnceMedia(source, sock));
+              if (isViewOnce || quotedType === 'image' || quotedType === 'video') {
+                ({ buffer, type } = await downloadViewOnceMedia(quoted, sock));
               } else {
-                // Para no-VO usamos el mensaje citante normal (downloadMedia ya resuelve el quote)
                 ({ buffer, type } = await downloadMedia(sock, msg));
               }
               const finalType = type || quotedType;
@@ -158,11 +173,12 @@ async function handleMessages(sock, { messages }) {
                   sock,
                   buffer,
                   finalType,
-                  `cita tipo=${finalType} vo=${isViewOnce} por=${isFromMe ? 'yo' : 'otro'} cache=${usedCache}`
+                  `cita tipo=${finalType} vo=${isViewOnce} por=${isFromMe ? 'yo' : 'otro'}`
                 );
+                if (quotedId) cacheBuffer(quotedId, buffer, finalType);
               }
             } catch (err) {
-              console.error(`[cita] ERROR | isFromMe=${isFromMe} | cache=${usedCache} | ${err.message}`);
+              console.error(`[cita] ERROR | isFromMe=${isFromMe} | ${err.message}`);
             }
             continue;
           }
