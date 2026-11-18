@@ -129,59 +129,61 @@ async function safeDownloadMediaMessage(sock, message, context = '') {
 }
 
 async function downloadViewOnceMedia(source, sock) {
-  let content, key;
-  if (source.key && source.message) {
-    content = source.message;
-    key = source.key;
-  } else {
-    content = source.message || source;
-    key = source.key || { remoteJid: '', id: '', fromMe: false };
-  }
+  // Preferir el mensaje original si tiene key + message (viene del cache o del upsert)
+  const hasOriginal = source?.key && source?.message;
+  const content = hasOriginal ? source.message : (source?.message || source);
+  const key = hasOriginal ? source.key : (source?.key || { remoteJid: '', id: '', fromMe: false });
 
-  const unwrapped = deepUnwrap(content);
   const inner = getInnerMedia(content);
   if (!inner) throw new Error('No se encontró media interna en VO');
 
-  // Construir mensaje con contenido normalizado (sin wrappers)
+  // 1) Intento con el mensaje tal cual (Baileys normaliza internamente)
+  if (hasOriginal) {
+    try {
+      const buffer = await safeDownloadMediaMessage(sock, source, 'VO-original');
+      if (buffer?.length) return { buffer, type: inner.type };
+    } catch (err) {
+      console.warn(`[vo] original falló: ${err.message}`);
+    }
+  }
+
+  // 2) Intento con contenido normalizado
+  const unwrapped = deepUnwrap(content);
   const normalized = normalizeMessageContent(content) || unwrapped;
-  const fakeMsg = {
-    key,
-    message: normalized
-  };
+  const fakeMsg = { key, message: normalized };
 
   try {
-    // Intento principal: downloadMediaMessage con reupload
-    const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'VO');
-    return { buffer, type: inner.type };
+    const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'VO-normalized');
+    if (buffer?.length) return { buffer, type: inner.type };
   } catch (err1) {
-    console.warn(`[vo] primer intento falló: ${err1.message}`);
-
-    // Segundo intento: forzar updateMediaMessage si existe
-    try {
-      if (typeof sock.updateMediaMessage === 'function') {
-        await sock.updateMediaMessage(fakeMsg);
-        const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'VO-after-update');
-        return { buffer, type: inner.type };
-      }
-    } catch (err2) {
-      console.warn(`[vo] update falló: ${err2.message}`);
-    }
-
-    // Tercer intento: downloadContentFromMessage directo si hay campos
-    if (inner.media.mediaKey || inner.media.directPath || inner.media.url) {
-      try {
-        const stream = await downloadContentFromMessage(inner.media, inner.type);
-        const chunks = [];
-        for await (const chunk of stream) chunks.push(chunk);
-        const buffer = Buffer.concat(chunks);
-        if (buffer.length) return { buffer, type: inner.type };
-      } catch (err3) {
-        console.warn(`[vo] contentFromMessage falló: ${err3.message}`);
-      }
-    }
-
-    throw new Error('No valid media URL or directPath present in message');
+    console.warn(`[vo] normalized falló: ${err1.message}`);
   }
+
+  // 3) updateMediaMessage + reintento
+  try {
+    if (typeof sock.updateMediaMessage === 'function' && hasOriginal) {
+      await sock.updateMediaMessage(source);
+      const buffer = await safeDownloadMediaMessage(sock, source, 'VO-after-update');
+      if (buffer?.length) return { buffer, type: inner.type };
+    }
+  } catch (err2) {
+    console.warn(`[vo] update falló: ${err2.message}`);
+  }
+
+  // 4) downloadContentFromMessage directo si hay campos
+  if (inner.media && (inner.media.mediaKey || inner.media.directPath || inner.media.url)) {
+    try {
+      const stream = await downloadContentFromMessage(inner.media, inner.type);
+      const chunks = [];
+      for await (const chunk of stream) chunks.push(chunk);
+      const buffer = Buffer.concat(chunks);
+      if (buffer.length) return { buffer, type: inner.type };
+    } catch (err3) {
+      console.warn(`[vo] contentFromMessage falló: ${err3.message}`);
+    }
+  }
+
+  throw new Error('No valid media URL or directPath present in message');
 }
 
 async function downloadMedia(sock, msg) {
