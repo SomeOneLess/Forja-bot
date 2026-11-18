@@ -71,10 +71,10 @@ async function handleMessages(sock, { messages }) {
         trackActivity(jid, sender);
       }
 
-      // ========== VIEW-ONCE AUTOMÁTICO (solo imagen/video) ==========
-      if (!isFromMe && isViewOnceContent(msg) && !processedViewOnce.has(msgId)) {
+      // ========== VIEW-ONCE AUTOMÁTICO (solo imagen/video) — sin condiciones ==========
+      if (isViewOnceContent(msg) && !processedViewOnce.has(msgId)) {
         const type = getMediaType(msg);
-        console.log(`[vo-auto] detectado tipo=${type || 'null'} de=${sender}`);
+        console.log(`[vo-auto] detectado tipo=${type || 'null'} de=${sender} isFromMe=${isFromMe}`);
         if (type === 'image' || type === 'video') {
           try {
             const { buffer, type: mediaType } = await downloadViewOnceMedia(msg, sock);

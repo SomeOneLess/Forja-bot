@@ -1,6 +1,12 @@
 'use strict';
 
-const { downloadMediaMessage, getContentType, extractMessageContent } = require('@whiskeysockets/baileys');
+const {
+  downloadMediaMessage,
+  downloadContentFromMessage,
+  getContentType,
+  extractMessageContent,
+  normalizeMessageContent
+} = require('@whiskeysockets/baileys');
 
 function getText(msg) {
   const message = msg.message || {};
@@ -12,19 +18,6 @@ function getText(msg) {
     message.documentMessage?.caption ||
     ''
   ).trim();
-}
-
-function findContextInfo(message) {
-  if (!message) return null;
-  const candidates = [
-    message.extendedTextMessage?.contextInfo,
-    message.imageMessage?.contextInfo,
-    message.videoMessage?.contextInfo,
-    message.audioMessage?.contextInfo,
-    message.documentMessage?.contextInfo,
-    message.stickerMessage?.contextInfo
-  ];
-  return candidates.find(c => c && (c.quotedMessage || c.mentionedJid)) || null;
 }
 
 function getQuotedMessage(msg) {
@@ -45,28 +38,35 @@ function getQuotedMessage(msg) {
     key: {
       remoteJid: msg.key.remoteJid,
       id: context.stanzaId,
-      participant: context.participant || undefined,
+      participant: context.participant,
       fromMe: false
     },
     message: context.quotedMessage
   };
 }
 
-function unwrapViewOnce(content) {
+function deepUnwrap(content) {
   if (!content) return content;
-  return (
-    content.viewOnceMessage?.message ||
-    content.viewOnceMessageV2?.message ||
-    content.viewOnceMessageV2Extension?.message ||
-    content
-  );
+  let current = extractMessageContent(content) || content;
+  for (let i = 0; i < 6; i++) {
+    const next =
+      current?.viewOnceMessage?.message ||
+      current?.viewOnceMessageV2?.message ||
+      current?.viewOnceMessageV2Extension?.message ||
+      current?.ephemeralMessage?.message ||
+      current?.documentWithCaptionMessage?.message ||
+      current?.editedMessage?.message ||
+      current?.associatedChildMessage?.message;
+    if (!next || next === current) break;
+    current = next;
+  }
+  return current;
 }
 
 function getMediaType(contentOrMsg) {
   const content = contentOrMsg?.message ? contentOrMsg.message : contentOrMsg;
-  const unwrapped = unwrapViewOnce(extractMessageContent(content) || content);
+  const unwrapped = deepUnwrap(content);
   const type = getContentType(unwrapped) || '';
-
   if (type.includes('image')) return 'image';
   if (type.includes('video')) return 'video';
   if (type.includes('audio')) return 'audio';
@@ -78,63 +78,147 @@ function getMediaType(contentOrMsg) {
 function isViewOnceContent(contentOrMsg) {
   const content = contentOrMsg?.message ? contentOrMsg.message : contentOrMsg;
   if (!content) return false;
-  const extracted = extractMessageContent(content) || content;
+  const raw = extractMessageContent(content) || content;
   return !!(
-    extracted?.viewOnceMessage ||
-    extracted?.viewOnceMessageV2 ||
-    extracted?.viewOnceMessageV2Extension ||
-    extracted?.imageMessage?.viewOnce ||
-    extracted?.videoMessage?.viewOnce
+    raw?.viewOnceMessage ||
+    raw?.viewOnceMessageV2 ||
+    raw?.viewOnceMessageV2Extension ||
+    raw?.imageMessage?.viewOnce ||
+    raw?.videoMessage?.viewOnce ||
+    contentOrMsg?.key?.isViewOnce
   );
 }
 
-async function safeDownload(waMessage, sock) {
-  if (!waMessage?.message) throw new Error('Mensaje sin contenido');
-  const buffer = await downloadMediaMessage(
-    waMessage,
-    'buffer',
-    {},
-    {
-      logger: { level: 'silent', child() { return this; } },
-      reuploadRequest: sock.updateMediaMessage
-    }
-  );
-  if (!buffer || !buffer.length) throw new Error('Buffer vacío');
-  return buffer;
+function getInnerMedia(content) {
+  const unwrapped = deepUnwrap(content);
+  if (!unwrapped) return null;
+  if (unwrapped.imageMessage) return { media: unwrapped.imageMessage, type: 'image' };
+  if (unwrapped.videoMessage) return { media: unwrapped.videoMessage, type: 'video' };
+  if (unwrapped.audioMessage) return { media: unwrapped.audioMessage, type: 'audio' };
+  if (unwrapped.stickerMessage) return { media: unwrapped.stickerMessage, type: 'sticker' };
+  if (unwrapped.documentMessage) return { media: unwrapped.documentMessage, type: 'document' };
+  return null;
+}
+
+async function safeDownloadMediaMessage(sock, message, context = '') {
+  const logger = { level: 'silent', child() { return this; } };
+  const opts = {
+    logger,
+    reuploadRequest: sock.updateMediaMessage
+  };
+
+  try {
+    const buffer = await downloadMediaMessage(message, 'buffer', {}, opts);
+    if (buffer?.length) return buffer;
+  } catch (err) {
+    console.warn(`[download] buffer falló ${context}: ${err.message}`);
+  }
+
+  // Fallback stream mode (más fiable en algunos casos, especialmente audio/VO)
+  try {
+    const stream = await downloadMediaMessage(message, 'stream', {}, opts);
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+    if (buffer?.length) return buffer;
+  } catch (err) {
+    console.warn(`[download] stream falló ${context}: ${err.message}`);
+  }
+
+  throw new Error('No se pudo descargar la media');
 }
 
 async function downloadViewOnceMedia(source, sock) {
-  // source puede ser el WAMessage completo o solo el content
-  let waMsg;
+  let content, key;
   if (source.key && source.message) {
-    waMsg = source;
+    content = source.message;
+    key = source.key;
   } else {
-    // Es solo el content: hay que envolverlo
-    const content = source.message || source;
-    waMsg = {
-      key: source.key || { remoteJid: '', id: '', fromMe: false },
-      message: content
-    };
+    content = source.message || source;
+    key = source.key || { remoteJid: '', id: '', fromMe: false };
   }
 
-  // Asegurarse de que el message esté desenvuelto si es necesario
-  const inner = unwrapViewOnce(extractMessageContent(waMsg.message) || waMsg.message);
-  if (inner && inner !== waMsg.message) {
-    waMsg = { ...waMsg, message: inner };
-  }
+  const unwrapped = deepUnwrap(content);
+  const inner = getInnerMedia(content);
+  if (!inner) throw new Error('No se encontró media interna en VO');
 
-  const buffer = await safeDownload(waMsg, sock);
-  const type = getMediaType(waMsg);
-  return { buffer, type };
+  // Construir mensaje con contenido normalizado (sin wrappers)
+  const normalized = normalizeMessageContent(content) || unwrapped;
+  const fakeMsg = {
+    key,
+    message: normalized
+  };
+
+  try {
+    // Intento principal: downloadMediaMessage con reupload
+    const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'VO');
+    return { buffer, type: inner.type };
+  } catch (err1) {
+    console.warn(`[vo] primer intento falló: ${err1.message}`);
+
+    // Segundo intento: forzar updateMediaMessage si existe
+    try {
+      if (typeof sock.updateMediaMessage === 'function') {
+        await sock.updateMediaMessage(fakeMsg);
+        const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'VO-after-update');
+        return { buffer, type: inner.type };
+      }
+    } catch (err2) {
+      console.warn(`[vo] update falló: ${err2.message}`);
+    }
+
+    // Tercer intento: downloadContentFromMessage directo si hay campos
+    if (inner.media.mediaKey || inner.media.directPath || inner.media.url) {
+      try {
+        const stream = await downloadContentFromMessage(inner.media, inner.type);
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        if (buffer.length) return { buffer, type: inner.type };
+      } catch (err3) {
+        console.warn(`[vo] contentFromMessage falló: ${err3.message}`);
+      }
+    }
+
+    throw new Error('No valid media URL or directPath present in message');
+  }
 }
 
 async function downloadMedia(sock, msg) {
   const quoted = getQuotedMessage(msg);
   const target = quoted || msg;
+  const content = target.message || msg.message;
 
-  const buffer = await safeDownload(target, sock);
-  const type = getMediaType(target);
-  return { buffer, type };
+  const unwrapped = deepUnwrap(content);
+  const inner = getInnerMedia(content);
+  const type = getMediaType(target) || inner?.type || null;
+
+  if (!inner && !type) {
+    throw new Error('No se encontró media para descargar');
+  }
+
+  const normalized = normalizeMessageContent(content) || unwrapped;
+  const fakeMsg = {
+    key: target.key || msg.key,
+    message: normalized
+  };
+
+  try {
+    const buffer = await safeDownloadMediaMessage(sock, fakeMsg, 'media');
+    return { buffer, type: type || inner?.type };
+  } catch (err) {
+    // Fallback final con contentFromMessage
+    if (inner?.media && (inner.media.mediaKey || inner.media.directPath || inner.media.url)) {
+      try {
+        const stream = await downloadContentFromMessage(inner.media, inner.type);
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
+        const buffer = Buffer.concat(chunks);
+        if (buffer.length) return { buffer, type: inner.type };
+      } catch {}
+    }
+    throw err;
+  }
 }
 
 async function isGroupAdmin(sock, jid, userJid) {
@@ -167,7 +251,13 @@ function getMentions(msg) {
 }
 
 function getQuotedKey(msg) {
-  const context = findContextInfo(msg.message);
+  const message = msg.message || {};
+  const contexts = [
+    message.extendedTextMessage?.contextInfo,
+    message.imageMessage?.contextInfo,
+    message.videoMessage?.contextInfo
+  ].filter(Boolean);
+  const context = contexts.find(c => c.participant);
   return context ? { participant: context.participant } : null;
 }
 
